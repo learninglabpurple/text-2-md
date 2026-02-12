@@ -1,0 +1,7 @@
+pymupdf4llm
+slack_bolt
+slack_sdk
+python-dotenv
+requests
+openai
+mammoth
