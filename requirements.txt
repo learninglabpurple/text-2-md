@@ -3,5 +3,6 @@ slack_bolt
 slack_sdk
 python-dotenv
 requests
-openai
+anthropic
 mammoth
+ocrmypdf

@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from convert import convert_file_bytes
+from convert import convert_file_bytes, split_markdown
 
 SUPPORTED_TYPES = {"pdf", "docx", "text"}
 
@@ -84,7 +84,7 @@ def handle_reaction(event, client, logger):
         try:
             file_bytes = download_file(doc_file["url_private_download"])
             logger.info("Downloaded %s (%s): %d bytes", name, filetype, len(file_bytes))
-            md_text = convert_file_bytes(file_bytes, filename=name, filetype=filetype)
+            md_text, report = convert_file_bytes(file_bytes, filename=name, filetype=filetype)
             logger.info("Converted %s: %d chars of markdown", name, len(md_text))
         except Exception:
             logger.exception("Failed to convert %s", name)
@@ -97,27 +97,103 @@ def handle_reaction(event, client, logger):
 
         if not md_text.strip():
             logger.warning("Conversion of %s produced empty markdown (possibly a scanned/image PDF)", name)
+            ocr_msg = ""
+            if report.ocr_needed:
+                ocr_msg = (
+                    f" OCR was attempted on {len(report.ocr_pages)} page(s)"
+                    " but extraction still produced no text."
+                )
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=message_ts,
-                text=f"The conversion of `{name}` produced no text. This may be a scanned/image-only PDF.",
+                text=(
+                    f"The conversion of `{name}` produced no text.{ocr_msg}"
+                    " This may be a scanned document that OCR couldn't process."
+                ),
             )
             continue
 
-        # Upload the .md file via a temp file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
-            tmp.write(md_text)
-            tmp_path = tmp.name
+        # Split output if MAX_OUTPUT_CHARS is configured
+        max_chars_str = os.environ.get("MAX_OUTPUT_CHARS", "")
+        max_chars = int(max_chars_str) if max_chars_str.strip().isdigit() else 0
+        base_name = name.rsplit(".", 1)[0]
+
+        if max_chars and len(md_text) > max_chars:
+            parts = split_markdown(md_text, max_chars)
+            total = len(parts)
+            for idx, part in enumerate(parts, 1):
+                part_filename = f"{base_name}_part{idx}of{total}.md"
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
+                    tmp.write(part)
+                    tmp_path = tmp.name
+                try:
+                    comment = (
+                        f"Part {idx}/{total} of `{name}` ({len(part):,} chars):"
+                        if idx == 1
+                        else f"Part {idx}/{total}:"
+                    )
+                    client.files_upload_v2(
+                        channel=channel,
+                        thread_ts=message_ts,
+                        file=tmp_path,
+                        filename=part_filename,
+                        initial_comment=comment,
+                    )
+                finally:
+                    os.unlink(tmp_path)
+        else:
+            # Upload the .md file via a temp file
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
+                tmp.write(md_text)
+                tmp_path = tmp.name
+            try:
+                client.files_upload_v2(
+                    channel=channel,
+                    thread_ts=message_ts,
+                    file=tmp_path,
+                    filename=md_filename,
+                    initial_comment=f"Here's the Markdown conversion of `{name}`:",
+                )
+            finally:
+                os.unlink(tmp_path)
+
+        # Upload the conversion report
+        report_filename = name.rsplit(".", 1)[0] + "_report.md"
+        report_md = report.to_markdown()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp_report:
+            tmp_report.write(report_md)
+            tmp_report_path = tmp_report.name
         try:
             client.files_upload_v2(
                 channel=channel,
                 thread_ts=message_ts,
-                file=tmp_path,
-                filename=md_filename,
-                initial_comment=f"Here's the Markdown conversion of `{name}`:",
+                file=tmp_report_path,
+                filename=report_filename,
+                initial_comment=f"Conversion report for `{name}`:",
             )
         finally:
-            os.unlink(tmp_path)
+            os.unlink(tmp_report_path)
+
+        # Post a brief inline summary
+        summary_parts = [f"Confidence: *{report.confidence}*"]
+        summary_parts.append(
+            f"Words: {report.source_words:,} source -> "
+            f"{report.output_words:,} output ({report.retention_pct}%)"
+        )
+        if report.ocr_needed:
+            summary_parts.append(
+                f"OCR: {len(report.ocr_pages)}/{report.total_pages} pages"
+            )
+        if report.missing_toc_entries:
+            summary_parts.append(
+                f"Missing sections: {len(report.missing_toc_entries)}"
+            )
+        summary = " | ".join(summary_parts)
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=message_ts,
+            text=summary,
+        )
 
         # Post a preview snippet in the thread
         preview = md_text[:PREVIEW_CHARS]
