@@ -128,6 +128,38 @@ class ConversionReport:
                     lines.append(f"- {r}")
         lines.append("")
 
+        # Commented headers detail
+        commented = self.page_artifact_stats.get("headers_commented", []) if self.page_artifact_stats else []
+        excluded = self.page_artifact_stats.get("headers_excluded", []) if self.page_artifact_stats else []
+        if commented or excluded:
+            lines.append("## Commented Running Headers")
+            lines.append(
+                "The following repeated lines were converted to "
+                "`<!-- header: ... -->` HTML comments. Review the list "
+                "to verify no meaningful content was caught."
+            )
+            lines.append("")
+            if commented:
+                lines.append("**Commented out:**")
+                for text, count in commented:
+                    lines.append(f"- `{text}` ({count}×)")
+                lines.append("")
+            if excluded:
+                lines.append(
+                    "**Kept as content** (repeated 3+ times but looked "
+                    "like dialogue or sentences — NOT commented out):"
+                )
+                for text, count in excluded:
+                    lines.append(f"- `{text}` ({count}×)")
+                lines.append("")
+            lines.append(
+                "*If a header was wrongly commented out, search the .md "
+                "for `<!-- header: ... -->` and remove the comment wrapper. "
+                "If content was wrongly kept, wrap it in "
+                "`<!-- header: ... -->` manually.*"
+            )
+            lines.append("")
+
         # Structure
         if self.toc_entries_total > 0:
             lines.append("## Structure Check")
@@ -509,6 +541,10 @@ def _comment_out_page_artifacts(
         s for s, count in line_counts.items()
         if count >= 3 and _looks_like_header(s)
     }
+    excluded = {
+        s for s, count in line_counts.items()
+        if count >= 3 and not _looks_like_header(s)
+    }
 
     # --- Pass 2: comment out page numbers and repeated headers ---
     max_page = total_pages if total_pages else 9999
@@ -532,6 +568,16 @@ def _comment_out_page_artifacts(
         if s in repeated:
             lines[i] = f"<!-- header: {s} -->"
             stats["running_headers_commented"] += 1
+
+    # Include detailed lists for the report
+    stats["headers_commented"] = sorted(
+        [(s, line_counts[s]) for s in repeated],
+        key=lambda x: -x[1],
+    )
+    stats["headers_excluded"] = sorted(
+        [(s, line_counts[s]) for s in excluded],
+        key=lambda x: -x[1],
+    )
 
     return "\n".join(lines), stats
 
