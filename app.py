@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 CONVERT_EMOJI = os.environ.get("CONVERT_EMOJI", "page_facing_up")
-PREVIEW_CHARS = 3000
 
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -195,16 +194,7 @@ def handle_reaction(event, client, logger):
             text=summary,
         )
 
-        # Post a preview snippet in the thread
-        preview = md_text[:PREVIEW_CHARS]
-        if len(md_text) > PREVIEW_CHARS:
-            preview += "\n\n_(truncated — see full file above)_"
-
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=message_ts,
-            text=f"*Preview of `{md_filename}`:*\n```\n{preview}\n```",
-        )
+        # Preview snippet removed — the .md file and report are sufficient
 
 
 # Acknowledge other events so Bolt doesn't log warnings for each one

@@ -48,6 +48,8 @@ class ConversionReport:
     chunk_details: list = field(default_factory=list)
     # Heading suggestions (matched TOC entries found in body)
     heading_suggestions: list = field(default_factory=list)
+    # Page artifact stats
+    page_artifact_stats: dict = field(default_factory=dict)
     # Front/back matter boundaries
     front_matter_end_line: int | None = None
     front_matter_summary: str = ""
@@ -88,6 +90,42 @@ class ConversionReport:
                 f"- **{self.chunks_fell_back} chunk(s) fell back to original** "
                 "(LLM dropped too much content)"
             )
+        # Page artifact stats
+        if self.page_artifact_stats:
+            pg = self.page_artifact_stats.get("page_numbers_commented", 0)
+            hd = self.page_artifact_stats.get("running_headers_commented", 0)
+            if pg or hd:
+                parts = []
+                if pg:
+                    parts.append(f"{pg} page numbers")
+                if hd:
+                    parts.append(f"{hd} running headers")
+                lines.append(
+                    f"- Converted to HTML comments: {', '.join(parts)} "
+                    "(preserved as metadata, hidden from text processing)"
+                )
+        # Discrepancy explanation
+        if self.source_words and self.output_words:
+            diff = self.source_words - self.output_words
+            if diff > 0:
+                lines.append("")
+                lines.append(f"**Word count difference ({diff:,} words) likely due to:**")
+                reasons = []
+                pg = self.page_artifact_stats.get("page_numbers_commented", 0) if self.page_artifact_stats else 0
+                hd = self.page_artifact_stats.get("running_headers_commented", 0) if self.page_artifact_stats else 0
+                if pg or hd:
+                    reasons.append(f"Page numbers and running headers commented out (~{pg + hd} lines)")
+                if self.chunks_fell_back > 0:
+                    reasons.append(f"LLM reflowed/cleaned {len(self.chunk_details) - self.chunks_fell_back} chunks (minor word count changes from fixing broken words, removing artifacts)")
+                if self.per_stage_words:
+                    raw = self.per_stage_words.get("raw", 0)
+                    after_regex = self.per_stage_words.get("after_regex", 0)
+                    if raw > after_regex:
+                        reasons.append(f"Regex cleanup removed {raw - after_regex:,} words (control chars, artifacts)")
+                if not reasons:
+                    reasons.append("LLM cleanup normalized whitespace and removed conversion artifacts")
+                for r in reasons:
+                    lines.append(f"- {r}")
         lines.append("")
 
         # Structure
@@ -369,17 +407,25 @@ def _extract_pdf_with_structure(pdf_path: str) -> tuple[str, list, dict]:
     Returns (markdown_text, toc_entries, source_stats).
     toc_entries: list of [level, title, page_num] from PyMuPDF.
     source_stats: {"per_page_words": [...], "total_words": int}.
+
+    Uses pymupdf4llm for markdown extraction. If pymupdf4llm returns
+    empty results (common with OCR-only PDFs), falls back to plain
+    text extraction via fitz.get_text().
     """
     doc = fitz.open(pdf_path)
     toc_entries = doc.get_toc()
 
     source_stats = {"per_page_words": [], "total_words": 0}
+    fallback_pages: list[str] = []
     for page in doc:
-        words = page.get_text().split()
+        text = page.get_text()
+        words = text.split()
         source_stats["per_page_words"].append(len(words))
         source_stats["total_words"] += len(words)
+        fallback_pages.append(text.strip())
     doc.close()
 
+    # Primary extraction via pymupdf4llm
     chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
 
     md_parts = []
@@ -389,6 +435,19 @@ def _extract_pdf_with_structure(pdf_path: str) -> tuple[str, list, dict]:
             md_parts.append(page_md)
 
     markdown_text = "\n\n".join(md_parts)
+
+    # Fallback: pymupdf4llm sometimes returns empty for OCR-only PDFs
+    # even though fitz.get_text() can read the text layer. Use plain
+    # text extraction in that case.
+    if not markdown_text.strip() and source_stats["total_words"] > 0:
+        logger.info(
+            "pymupdf4llm returned empty — falling back to fitz.get_text() "
+            "(%d words across %d pages)",
+            source_stats["total_words"],
+            len(fallback_pages),
+        )
+        markdown_text = "\n\n".join(p for p in fallback_pages if p)
+
     return markdown_text, toc_entries, source_stats
 
 
@@ -405,6 +464,76 @@ def clean_markdown_regex(md_text: str) -> str:
     text = re.sub(r"^[._\-=]{5,}$", "", text, flags=re.MULTILINE)
     text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
     return text
+
+
+def _comment_out_page_artifacts(
+    md_text: str, total_pages: int = 0
+) -> tuple[str, dict]:
+    """Convert standalone page numbers and repeated running headers to HTML comments.
+
+    Page numbers and headers are preserved as ``<!-- page: 47 -->`` or
+    ``<!-- header: Preface to the Morningside Edition -->`` so they remain
+    in the file as metadata but don't affect text processing.
+
+    Returns (cleaned_text, stats_dict) where stats_dict records counts.
+    """
+    lines = md_text.split("\n")
+    stats: dict = {"page_numbers_commented": 0, "running_headers_commented": 0}
+
+    # --- Pass 1: detect repeated short lines (running headers) ---
+    # A line that appears 3+ times, is ≤50 chars, and looks like a header
+    # (not content) is likely a running header from PDF layout.
+    line_counts: dict[str, int] = {}
+    for line in lines:
+        s = line.strip()
+        if s and 3 <= len(s) <= 50:
+            line_counts[s] = line_counts.get(s, 0) + 1
+
+    def _looks_like_header(s: str) -> bool:
+        """Return True if a repeated line looks like a running header, not content."""
+        # Exclude dialogue attributions ("Yang Chu said:", "He replied:")
+        if s.endswith(":"):
+            return False
+        # Exclude lines that look like sentences (contain verbs/common words)
+        # Running headers are typically: titles, chapter names, author names
+        # They're often italicized in markdown: _Title Here_
+        if re.match(r"^_.*_$", s):
+            return True  # Italicized standalone line — very likely a header
+        # Exclude lines with sentence-like punctuation (periods, commas, semicolons)
+        if re.search(r"[.;,!?]", s):
+            return False
+        # Accept remaining short standalone title-like lines
+        return True
+
+    repeated = {
+        s for s, count in line_counts.items()
+        if count >= 3 and _looks_like_header(s)
+    }
+
+    # --- Pass 2: comment out page numbers and repeated headers ---
+    max_page = total_pages if total_pages else 9999
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+
+        # Standalone page numbers: a line that is just 1-4 digits,
+        # not inside a paragraph (prev and next lines are blank or absent)
+        if re.match(r"^\d{1,4}$", s):
+            num = int(s)
+            prev_blank = (i == 0) or not lines[i - 1].strip()
+            next_blank = (i == len(lines) - 1) or not lines[i + 1].strip()
+            if prev_blank and next_blank and 1 <= num <= max_page:
+                lines[i] = f"<!-- page: {s} -->"
+                stats["page_numbers_commented"] += 1
+                continue
+
+        # Repeated running headers (only lines that passed the header filter)
+        if s in repeated:
+            lines[i] = f"<!-- header: {s} -->"
+            stats["running_headers_commented"] += 1
+
+    return "\n".join(lines), stats
 
 
 # ---------------------------------------------------------------------------
@@ -1001,8 +1130,9 @@ def convert_and_clean(
     md_text: str,
     report: ConversionReport,
     toc_entries: list | None = None,
+    total_pages: int = 0,
 ) -> str:
-    """Run the full cleanup pipeline: regex -> LLM -> normalize."""
+    """Run the full cleanup pipeline: regex -> LLM -> normalize -> comment artifacts."""
     report.per_stage_words["raw"] = len(md_text.split())
 
     md_text = clean_markdown_regex(md_text)
@@ -1017,6 +1147,10 @@ def convert_and_clean(
 
     md_text = normalize_markdown(md_text, toc_entries=toc_entries)
     report.per_stage_words["after_normalize"] = len(md_text.split())
+
+    md_text, artifact_stats = _comment_out_page_artifacts(md_text, total_pages)
+    report.page_artifact_stats = artifact_stats
+    report.per_stage_words["after_artifact_cleanup"] = len(md_text.split())
 
     return md_text
 
@@ -1081,7 +1215,10 @@ def convert_file_bytes(
         return md_text, report
 
     logger.info("Raw conversion: %d chars, %d words", len(md_text), len(md_text.split()))
-    cleaned = convert_and_clean(md_text, report=report, toc_entries=toc_entries)
+    cleaned = convert_and_clean(
+        md_text, report=report, toc_entries=toc_entries,
+        total_pages=report.total_pages,
+    )
     logger.info("After cleanup: %d chars, %d words", len(cleaned), len(cleaned.split()))
 
     # Detect and mark front/back matter boundaries
@@ -1108,7 +1245,55 @@ def convert_file_bytes(
         )
         report.confidence = "high" if report.retention_pct >= 95 else "medium"
 
+    # Prepend YAML frontmatter for library cataloging
+    if cleaned.strip():
+        cleaned = _build_yaml_frontmatter(report) + cleaned
+
     return cleaned, report
+
+
+# ---------------------------------------------------------------------------
+# YAML frontmatter
+# ---------------------------------------------------------------------------
+
+
+def _build_yaml_frontmatter(report: ConversionReport) -> str:
+    """Build a YAML frontmatter block from the conversion report.
+
+    This metadata helps when building a library of converted .md files —
+    it's machine-readable and compatible with tools like Obsidian, Jekyll,
+    and Pandoc.
+    """
+    from datetime import date
+
+    lines = ["---"]
+    lines.append(f"source_file: \"{report.filename}\"")
+    lines.append(f"source_type: {report.filetype}")
+    lines.append(f"converted: {date.today().isoformat()}")
+    lines.append(f"confidence: {report.confidence}")
+    lines.append(f"retention_pct: {report.retention_pct}")
+    lines.append(f"source_words: {report.source_words}")
+    lines.append(f"output_words: {report.output_words}")
+
+    if report.filetype == "pdf":
+        lines.append(f"pages: {report.total_pages}")
+        if report.ocr_needed:
+            lines.append(f"ocr_applied: true")
+            lines.append(f"ocr_pages: {len(report.ocr_pages)}")
+        else:
+            lines.append(f"ocr_applied: false")
+
+    if report.toc_entries_total > 0:
+        lines.append(f"toc_entries: {report.toc_entries_total}")
+
+    if report.front_matter_end_line is not None:
+        lines.append(f"front_matter_ends: {report.front_matter_end_line}")
+    if report.back_matter_start_line is not None:
+        lines.append(f"back_matter_starts: {report.back_matter_start_line}")
+
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
