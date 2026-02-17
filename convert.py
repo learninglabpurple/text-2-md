@@ -314,6 +314,97 @@ class ConversionReport:
             self.confidence, "Unknown"
         )
         lines.append(f"**{label}** ({self.confidence})")
+        lines.append("")
+
+        # Comprehensive follow-up prompt
+        # Build a single prompt that addresses everything the report flagged
+        followup_tasks: list[str] = []
+
+        if self.heading_suggestions:
+            heading_items = "; ".join(
+                f"line {s['line_num']}: \"{s['line_text'][:60]}\" → heading \"{s['toc_title']}\""
+                for s in self.heading_suggestions
+            )
+            followup_tasks.append(
+                f"HEADINGS: The following lines should be promoted to Markdown "
+                f"headings (## level). For each, replace the line with a proper "
+                f"heading: {heading_items}"
+            )
+
+        failed_chunks = [
+            d for d in self.chunk_details if d["status"] in ("failed", "skipped")
+        ]
+        if failed_chunks:
+            chunk_ranges = ", ".join(
+                f"lines {cd['start_line']}–{cd['end_line']}"
+                for cd in failed_chunks
+            )
+            followup_tasks.append(
+                f"UNCLEANED SECTIONS: The following line ranges were not "
+                f"processed by the cleanup LLM and may contain OCR artifacts, "
+                f"broken words, or stray characters. Clean them while "
+                f"preserving all content: {chunk_ranges}"
+            )
+
+        commented_headers = (
+            self.page_artifact_stats.get("headers_commented", [])
+            if self.page_artifact_stats else []
+        )
+        excluded_headers = (
+            self.page_artifact_stats.get("headers_excluded", [])
+            if self.page_artifact_stats else []
+        )
+        if commented_headers or excluded_headers:
+            review_items = []
+            if commented_headers:
+                review_items.append(
+                    "Commented out (verify these are running headers, "
+                    "not content): " + ", ".join(
+                        f"\"{t}\" ({c}×)" for t, c in commented_headers
+                    )
+                )
+            if excluded_headers:
+                review_items.append(
+                    "Kept as content (verify these are NOT running headers): "
+                    + ", ".join(
+                        f"\"{t}\" ({c}×)" for t, c in excluded_headers
+                    )
+                )
+            followup_tasks.append(
+                "RUNNING HEADERS: Review the following lines that were "
+                "commented out as `<!-- header: ... -->` or kept as content. "
+                "If any were misclassified, fix them. " + " | ".join(review_items)
+            )
+
+        if self.missing_toc_entries:
+            missing = ", ".join(f"\"{e}\"" for e in self.missing_toc_entries)
+            followup_tasks.append(
+                f"MISSING SECTIONS: The following TOC entries from the source "
+                f"PDF were not found in the output. Check whether the content "
+                f"is present under a different name or was lost: {missing}"
+            )
+
+        if followup_tasks:
+            lines.append("## Follow-up Prompt")
+            lines.append(
+                "Copy the prompt below and paste it into an LLM along with "
+                "the .md file to address all flagged issues in a single pass:"
+            )
+            lines.append("")
+            lines.append("```")
+            lines.append(
+                "You are reviewing a Markdown file converted from a "
+                "scholarly/academic PDF. The automated conversion flagged "
+                "the issues listed below. For each issue, make the "
+                "requested fix. CRITICAL: Do not delete, summarize, or "
+                "skip any content. Every sentence must be preserved. "
+                "Output the complete corrected .md file."
+            )
+            lines.append("")
+            for i, task in enumerate(followup_tasks, 1):
+                lines.append(f"{i}. {task}")
+            lines.append("```")
+            lines.append("")
 
         return "\n".join(lines)
 
