@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slack bot that converts document attachments (PDF, DOCX, TXT) to Markdown when a user reacts with an emoji."""
+"""Slack bot that converts document attachments (PDF, DOCX, TXT, HTML) to Markdown when a user reacts with an emoji."""
 
 import os
 import logging
@@ -12,10 +12,10 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from convert import convert_file_bytes, split_markdown
 
-SUPPORTED_TYPES = {"pdf", "docx", "text"}
+SUPPORTED_TYPES = {"pdf", "docx", "text", "html"}
 
 # Map file extensions to our internal type when Slack's filetype doesn't match
-EXT_TO_TYPE = {".pdf": "pdf", ".docx": "docx", ".txt": "text"}
+EXT_TO_TYPE = {".pdf": "pdf", ".docx": "docx", ".txt": "text", ".html": "html", ".htm": "html"}
 
 load_dotenv()
 

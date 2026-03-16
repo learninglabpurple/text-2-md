@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Convert documents (PDF, DOCX, TXT) to Markdown — used by both the CLI and Slack bot."""
+"""Convert documents (PDF, DOCX, TXT, HTML) to Markdown — used by both the CLI and Slack bot."""
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import logging
@@ -10,11 +11,13 @@ import os
 import re
 import tempfile
 import threading
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import fitz  # PyMuPDF
 import mammoth
+import markdownify
 import ocrmypdf
 import pymupdf4llm
 from anthropic import Anthropic
@@ -389,6 +392,16 @@ class ConversionReport:
             lines.append(
                 "Copy the prompt below and paste it into an LLM along with "
                 "the .md file to address all flagged issues in a single pass:"
+            )
+            lines.append("")
+            lines.append(
+                "> **Tip:** If the document is under ~15k words, a single "
+                "pass with this prompt is probably fine — the follow-up tasks "
+                "are specific enough (line numbers, exact strings) that the "
+                "LLM can locate and fix them. If the document is much larger, "
+                "consider splitting the .md along the line ranges mentioned "
+                "below and doing the follow-up fixes in sections, similar to "
+                "how the original conversion chunked things."
             )
             lines.append("")
             lines.append("```")
@@ -804,7 +817,7 @@ def clean_markdown_llm(
         line_offset += chunk.count("\n") + 1  # +1 for the join separator
 
     cleaned_chunks: list[str] = []
-    min_retention = 0.6
+    min_retention = 0.95
     api_failed = False  # stop retrying after a fatal API error
 
     for i, chunk in enumerate(chunks):
@@ -1303,6 +1316,16 @@ def convert_txt_bytes(txt_bytes: bytes) -> str:
     return txt_bytes.decode("utf-8", errors="replace")
 
 
+def convert_html_bytes(html_bytes: bytes) -> str:
+    """Convert in-memory HTML bytes to a Markdown string."""
+    html_text = html_bytes.decode("utf-8", errors="replace")
+    return markdownify.markdownify(
+        html_text,
+        heading_style="ATX",
+        strip=["script", "style"],
+    )
+
+
 def convert_file_bytes(
     file_bytes: bytes, filename: str, filetype: str
 ) -> tuple[str, ConversionReport]:
@@ -1340,6 +1363,10 @@ def convert_file_bytes(
 
     elif filetype == "text":
         md_text = convert_txt_bytes(file_bytes)
+        report.source_words = len(md_text.split())
+
+    elif filetype == "html":
+        md_text = convert_html_bytes(file_bytes)
         report.source_words = len(md_text.split())
 
     else:
@@ -1493,40 +1520,189 @@ def convert_pdf_bytes(
     return convert_file_bytes(pdf_bytes, filename, "pdf")
 
 
-def convert_pdfs(pdf_dir: Path = Path("pdfs/"), out_dir: Path = Path("markdown/")):
-    """Convert all PDFs in pdf_dir to Markdown files in out_dir."""
-    out_dir.mkdir(exist_ok=True)
-    pdf_files = list(pdf_dir.glob("*.pdf"))
+SUPPORTED_EXTENSIONS = {".pdf": "pdf", ".docx": "docx", ".txt": "text", ".html": "html", ".htm": "html"}
 
-    if not pdf_files:
-        print(f"No PDF files found in {pdf_dir}")
+
+# ---------------------------------------------------------------------------
+# LLM-based filename extraction
+# ---------------------------------------------------------------------------
+
+FILENAME_PROMPT = """\
+You are analyzing a document to extract metadata for generating a filename. \
+Given the beginning of a document, identify:
+1. The author's last name (if identifiable)
+2. The author's first name (if identifiable)
+3. A short title (2-4 words max)
+
+Respond with ONLY a JSON object in this exact format:
+{"author_last": "smith", "author_first": "john", "title": "on human nature"}
+
+Rules:
+- Use lowercase for all values
+- If the author cannot be determined, use empty strings for author_last and author_first
+- If there are multiple authors, use only the first author's name
+- The title should capture the main subject — abbreviate long titles
+- Strip subtitles, edition info, and publisher names from the title
+- If you truly cannot determine a title, use "untitled"
+- Do NOT include any text outside the JSON object"""
+
+
+def _to_kebab_case(text: str) -> str:
+    """Convert a string to kebab-case, stripping non-alphanumeric characters."""
+    # Lowercase, replace non-alphanum with hyphens, collapse multiple hyphens
+    s = text.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-")
+
+
+def _extract_filename_llm(md_text: str) -> str | None:
+    """Use Claude to extract author and title from document content, return a kebab-case filename.
+
+    Returns a string like "smith-on-human-nature" or None if extraction fails.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+
+    # Send roughly the first 500 words
+    words = md_text.split()
+    sample = " ".join(words[:500])
+
+    client = Anthropic(api_key=api_key)
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=256,
+            system=FILENAME_PROMPT,
+            messages=[{"role": "user", "content": sample}],
+            temperature=0,
+        )
+        raw = response.content[0].text.strip()
+        try:
+            meta = json.loads(raw)
+        except json.JSONDecodeError:
+            json_match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+            if json_match:
+                meta = json.loads(json_match.group())
+            else:
+                logger.warning("Could not parse filename metadata: %s", raw[:200])
+                return None
+    except Exception:
+        logger.exception("Filename extraction LLM call failed")
+        return None
+
+    author_last = _to_kebab_case(meta.get("author_last", ""))
+    author_first = _to_kebab_case(meta.get("author_first", ""))
+    title = _to_kebab_case(meta.get("title", ""))
+
+    if not title:
+        return None
+
+    author_parts = [p for p in [author_last, author_first] if p]
+    parts = ["-".join(author_parts)] if author_parts else []
+    parts.append(title)
+    return "-".join(parts)
+
+
+def convert_docs(in_dir: Path = Path("input/"), out_dir: Path = Path("output/")):
+    """Convert all supported files (PDF, DOCX, TXT) in in_dir to Markdown in out_dir."""
+    out_dir.mkdir(exist_ok=True)
+    files = [f for f in sorted(in_dir.iterdir()) if f.suffix.lower() in SUPPORTED_EXTENSIONS]
+
+    if not files:
+        print(f"No supported files found in {in_dir}/ (pdf, docx, txt)")
         return
 
     max_chars_str = os.environ.get("MAX_OUTPUT_CHARS", "")
     max_chars = int(max_chars_str) if max_chars_str.strip().isdigit() else 0
 
-    for pdf_file in pdf_files:
-        md_text, report = convert_file_bytes(
-            pdf_file.read_bytes(), pdf_file.name, "pdf"
-        )
+    started = datetime.now(timezone.utc)
+    log_entries = []
+    converted = 0
+    used_names: set[str] = set()  # track output names to avoid collisions
 
-        if max_chars and len(md_text) > max_chars:
-            parts = split_markdown(md_text, max_chars)
-            total = len(parts)
-            for idx, part in enumerate(parts, 1):
-                part_path = out_dir / f"{pdf_file.stem}_part{idx}of{total}.md"
-                part_path.write_text(part)
-                print(f"  Part {idx}/{total}: {part_path} ({len(part):,} chars)")
-        else:
-            out_path = out_dir / f"{pdf_file.stem}.md"
-            out_path.write_text(md_text)
-            print(f"Converted: {pdf_file.name} -> {out_path}")
+    print(f"Found {len(files)} file(s) to convert\n")
+    for i, filepath in enumerate(files, 1):
+        filetype = SUPPORTED_EXTENSIONS[filepath.suffix.lower()]
+        print(f"[{i}/{len(files)}] {filepath.name} ({filetype})")
+        entry = {"file": filepath.name, "type": filetype}
+        try:
+            raw_bytes = filepath.read_bytes()
+            entry["input_bytes"] = len(raw_bytes)
+            md_text, report = convert_file_bytes(raw_bytes, filepath.name, filetype)
 
-        report_path = out_dir / f"{pdf_file.stem}_report.md"
-        report_path.write_text(report.to_markdown())
+            if not md_text.strip():
+                entry["status"] = "skipped"
+                entry["reason"] = "no text extracted"
+                print(f"  -> skipped (no text extracted)\n")
+            else:
+                # Generate kebab-case filename from document content
+                base_name = _extract_filename_llm(md_text)
+                if not base_name:
+                    base_name = _to_kebab_case(filepath.stem)
+                    logger.info("LLM filename extraction failed — falling back to: %s", base_name)
 
-        print(f"  Report: {report_path}")
-        print(f"  Confidence: {report.confidence} | Retention: {report.retention_pct}%")
+                # Deduplicate: append -2, -3, etc. if name already used
+                final_name = base_name
+                counter = 2
+                while final_name in used_names:
+                    final_name = f"{base_name}-{counter}"
+                    counter += 1
+                used_names.add(final_name)
+
+                if max_chars and len(md_text) > max_chars:
+                    parts = split_markdown(md_text, max_chars)
+                    for idx, part in enumerate(parts, 1):
+                        part_path = out_dir / f"{final_name}_part{idx}of{len(parts)}.md"
+                        part_path.write_text(part)
+                    entry["output_file"] = f"{final_name}_part*of{len(parts)}.md"
+                    entry["parts"] = len(parts)
+                else:
+                    out_path = out_dir / f"{final_name}.md"
+                    out_path.write_text(md_text)
+                    entry["output_file"] = out_path.name
+
+                # Per-file conversion report
+                report_path = out_dir / f"{final_name}_report.md"
+                report_path.write_text(report.to_markdown())
+
+                entry["status"] = "ok"
+                entry["output_name"] = final_name
+                entry["output_words"] = len(md_text.split())
+                entry["confidence"] = report.confidence
+                entry["retention_pct"] = report.retention_pct
+                converted += 1
+                print(f"  -> {entry['output_file']}  [{report.confidence} confidence, {report.retention_pct}% retention]\n")
+
+        except Exception as exc:
+            logger.exception("Failed to convert %s", filepath.name)
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+            print(f"  -> FAILED (see log)\n")
+        log_entries.append(entry)
+
+    # Write batch log
+    log_data = {
+        "started": started.isoformat(),
+        "finished": datetime.now(timezone.utc).isoformat(),
+        "input_dir": str(in_dir),
+        "output_dir": str(out_dir),
+        "total": len(files),
+        "converted": converted,
+        "skipped": sum(1 for e in log_entries if e["status"] == "skipped"),
+        "errors": sum(1 for e in log_entries if e["status"] == "error"),
+        "files": log_entries,
+    }
+    log_path = out_dir / "conversion.log.json"
+    log_path.write_text(json.dumps(log_data, indent=2))
+    print(f"Done. {converted}/{len(files)} converted. Log: {log_path}")
+
+
+# Backward-compatible alias
+def convert_pdfs(pdf_dir: Path = Path("pdfs/"), out_dir: Path = Path("markdown/")):
+    """Convert all PDFs in pdf_dir to Markdown files in out_dir."""
+    convert_docs(pdf_dir, out_dir)
 
 
 if __name__ == "__main__":
@@ -1534,4 +1710,9 @@ if __name__ == "__main__":
 
     load_dotenv(override=True)
     logging.basicConfig(level=logging.INFO)
-    convert_pdfs()
+
+    parser = argparse.ArgumentParser(description="Batch-convert documents to Markdown")
+    parser.add_argument("input", nargs="?", default="input", help="Input folder (default: input/)")
+    parser.add_argument("output", nargs="?", default="output", help="Output folder (default: output/)")
+    args = parser.parse_args()
+    convert_docs(Path(args.input), Path(args.output))

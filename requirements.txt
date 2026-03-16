@@ -6,3 +6,4 @@ requests
 anthropic
 mammoth
 ocrmypdf
+markdownify

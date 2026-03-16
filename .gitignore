@@ -4,4 +4,7 @@ __pycache__/
 .DS_Store
 pdfs/
 markdown/
+input/
+output/
 output-norming/
+.claude/
