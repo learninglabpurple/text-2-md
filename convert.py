@@ -58,6 +58,8 @@ class ConversionReport:
     front_matter_summary: str = ""
     back_matter_start_line: int | None = None
     back_matter_summary: str = ""
+    # Chunk overlap deduplication
+    overlap_dedup: list = field(default_factory=list)
     # Overall
     confidence: str = "unknown"
 
@@ -298,6 +300,31 @@ class ConversionReport:
             lines.append("```")
             lines.append("")
 
+        # Chunk overlap deduplication
+        if self.overlap_dedup:
+            total_deduped = sum(d["lines_removed"] for d in self.overlap_dedup)
+            lines.append("## Chunk Overlap Deduplication")
+            lines.append(
+                f"- {total_deduped} line(s) were removed at chunk boundaries "
+                "where overlap context produced duplicates"
+            )
+            lines.append(
+                "- These are almost certainly artifacts of the chunked processing, "
+                "but if the original text intentionally repeats lines (e.g., "
+                "refrains), verify these removals:"
+            )
+            for d in self.overlap_dedup:
+                preview = " / ".join(
+                    f'"{c[:50]}"' for c in d["content"][:3]
+                )
+                if len(d["content"]) > 3:
+                    preview += " / ..."
+                lines.append(
+                    f"  - Chunk {d['chunk_num']} (line ~{d['output_line']}): "
+                    f"removed {d['lines_removed']} line(s): {preview}"
+                )
+            lines.append("")
+
         # LLM issues (filter out raw API error strings — those are covered above)
         all_issues = [
             iss
@@ -426,13 +453,61 @@ class ConversionReport:
 # Prompts
 # ---------------------------------------------------------------------------
 
-CLEANUP_PROMPT = """\
+_FORMAT_PREAMBLES = {
+    "pdf_ocr": (
+        "This text was extracted from a scanned PDF using OCR. Expect OCR "
+        "artifacts: characters like 'rn' misread as 'm', '0' for 'O', 'l' "
+        "for '1', garbled words from poor scan quality. Actively fix these."
+    ),
+    "pdf_digital": (
+        "This text was extracted from a digital PDF. Some extraction artifacts "
+        "may be present (broken words, stray characters), but OCR-type errors "
+        "are unlikely."
+    ),
+    "docx": (
+        "This text was converted from a Word document (.docx). Formatting "
+        "artifacts may be present, but garbled words and OCR errors are not "
+        "expected. Be conservative about changing unusual spellings — they "
+        "may be intentional."
+    ),
+    "text": (
+        "This text was converted from a plain text file. Preserve spelling "
+        "exactly as-is unless characters are clearly corrupted (control "
+        "characters, encoding errors). Unusual or archaic spellings are "
+        "likely intentional."
+    ),
+    "html": (
+        "This text was converted from an HTML document. The content should "
+        "be largely clean. Preserve spelling exactly as-is — unusual or "
+        "archaic spellings are likely intentional, not extraction errors."
+    ),
+}
+
+_CLEANUP_TASK_1_OCR = "1. Fix garbled or broken words (OCR/extraction errors)"
+_CLEANUP_TASK_1_NON_OCR = (
+    "1. Fix clearly corrupted characters (encoding errors, control characters) "
+    "but preserve unusual or archaic spellings"
+)
+
+
+def _build_cleanup_prompt(filetype: str = "pdf", ocr_applied: bool = False) -> str:
+    """Build the cleanup system prompt with a format-specific preamble."""
+    if filetype == "pdf":
+        preamble = _FORMAT_PREAMBLES["pdf_ocr" if ocr_applied else "pdf_digital"]
+        task_1 = _CLEANUP_TASK_1_OCR
+    else:
+        preamble = _FORMAT_PREAMBLES.get(filetype, _FORMAT_PREAMBLES["text"])
+        task_1 = _CLEANUP_TASK_1_NON_OCR
+
+    return f"""\
 You are a document cleanup assistant working in an academic/scholarly setting. \
 The texts you process are source materials for university research and teaching — \
 they may include philosophy, history, literature, religion, and other humanities \
 subjects spanning all time periods and cultures. Your HIGHEST PRIORITY is \
 preserving every piece of original content with full fidelity. The following \
 markdown was extracted from a document and may contain conversion artifacts.
+
+{preamble}
 
 BEFORE CLEANING, assess what kind of text you are looking at. The text may contain \
 any mix of the following — treat each section according to its type:
@@ -461,7 +536,7 @@ If a section is ambiguous, ERR ON THE SIDE OF PRESERVING LINE BREAKS — it is \
 better to leave a hard wrap in prose than to destroy a line of verse.
 
 CLEANUP TASKS:
-1. Fix garbled or broken words (OCR/extraction errors)
+{task_1}
 2. Remove stray characters, repeated punctuation artifacts, and control characters
 3. Fix broken line breaks (words split across lines with hyphens)
 4. Remove running headers and footers (author names, book titles, page numbers \
@@ -477,8 +552,8 @@ CRITICAL RULES:
 
 ISSUE REPORTING:
 On the very first line of your response, output a JSON object in this exact format:
-ISSUES_JSON:{"issues": ["list of any problems you noticed"], "garbled_words_fixed": 0}
-If you found no issues, use: ISSUES_JSON:{"issues": [], "garbled_words_fixed": 0}
+ISSUES_JSON:{{"issues": ["list of any problems you noticed"], "garbled_words_fixed": 0}}
+If you found no issues, use: ISSUES_JSON:{{"issues": [], "garbled_words_fixed": 0}}
 Then a blank line, then the cleaned markdown. Do NOT wrap the markdown in code fences."""
 
 
@@ -773,6 +848,10 @@ def _chunk_by_sections(md_text: str, max_chunk_words: int = 3000) -> list[str]:
 # LLM cleanup (Anthropic Claude)
 # ---------------------------------------------------------------------------
 
+_OVERLAP_LINES = 10
+_OVERLAP_START = "[CONTEXT: last lines from previous section — do not include these in your output]"
+_OVERLAP_END = "[END CONTEXT]"
+
 
 def _parse_llm_response(raw: str) -> tuple[str, dict]:
     """Split an LLM response into (cleaned_text, issues_dict).
@@ -796,7 +875,11 @@ def _parse_llm_response(raw: str) -> tuple[str, dict]:
 
 
 def clean_markdown_llm(
-    md_text: str, report: ConversionReport | None = None
+    md_text: str,
+    report: ConversionReport | None = None,
+    filetype: str = "pdf",
+    ocr_applied: bool = False,
+    on_progress: "Callable[[int, int], None] | None" = None,
 ) -> str:
     """Use Anthropic Claude to clean up conversion artifacts in the markdown."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -805,6 +888,7 @@ def clean_markdown_llm(
         return md_text
 
     client = Anthropic(api_key=api_key)
+    system_prompt = _build_cleanup_prompt(filetype, ocr_applied)
 
     max_chunk_words = 3000
     chunks = _chunk_by_sections(md_text, max_chunk_words)
@@ -819,6 +903,7 @@ def clean_markdown_llm(
     cleaned_chunks: list[str] = []
     min_retention = 0.95
     api_failed = False  # stop retrying after a fatal API error
+    prev_tail: list[str] = []  # last N lines of previous cleaned chunk
 
     for i, chunk in enumerate(chunks):
         input_words = len(chunk.split())
@@ -828,6 +913,7 @@ def clean_markdown_llm(
 
         if api_failed:
             cleaned_chunks.append(chunk)
+            prev_tail = chunk.split("\n")[-_OVERLAP_LINES:]
             if report is not None:
                 report.chunks_fell_back += 1
                 report.chunk_details.append({
@@ -840,6 +926,17 @@ def clean_markdown_llm(
                 })
             continue
 
+        # Build LLM input: prepend overlap context from previous chunk
+        if i > 0 and prev_tail:
+            overlap_block = (
+                _OVERLAP_START + "\n"
+                + "\n".join(prev_tail) + "\n"
+                + _OVERLAP_END + "\n\n"
+            )
+            llm_input = overlap_block + chunk
+        else:
+            llm_input = chunk
+
         logger.info(
             "LLM cleanup: chunk %d/%d (%d words, lines %d–%d)",
             i + 1, len(chunks), input_words, start_line, end_line,
@@ -848,8 +945,8 @@ def clean_markdown_llm(
             response = client.messages.create(
                 model="claude-sonnet-4-5-20250929",
                 max_tokens=8192,
-                system=CLEANUP_PROMPT,
-                messages=[{"role": "user", "content": chunk}],
+                system=system_prompt,
+                messages=[{"role": "user", "content": llm_input}],
                 temperature=0,
             )
             raw_response = response.content[0].text
@@ -876,6 +973,7 @@ def clean_markdown_llm(
                 api_failed = True
 
             cleaned_chunks.append(chunk)
+            prev_tail = chunk.split("\n")[-_OVERLAP_LINES:]
             if report is not None:
                 report.chunk_issues.append(
                     {"issues": [f"LLM cleanup unavailable: {exc}"], "garbled_words_fixed": 0}
@@ -893,6 +991,31 @@ def clean_markdown_llm(
 
         cleaned, chunk_issues = _parse_llm_response(raw_response)
 
+        # Strip duplicate lines at the start that match the overlap context
+        if prev_tail and cleaned:
+            cleaned_lines = cleaned.split("\n")
+            duped: list[str] = []
+            tail_idx = 0
+            for line in cleaned_lines:
+                if tail_idx < len(prev_tail) and line.strip() == prev_tail[tail_idx].strip():
+                    duped.append(line)
+                    tail_idx += 1
+                else:
+                    break
+            if duped:
+                cleaned = "\n".join(cleaned_lines[len(duped):])
+                logger.info(
+                    "Chunk %d/%d: stripped %d duplicate overlap line(s)",
+                    i + 1, len(chunks), len(duped),
+                )
+                if report is not None:
+                    report.overlap_dedup.append({
+                        "chunk_num": i + 1,
+                        "lines_removed": len(duped),
+                        "content": [l.strip() for l in duped],
+                        "output_line": start_line,
+                    })
+
         output_words = len(cleaned.split())
         retention = output_words / input_words if input_words else 1.0
 
@@ -907,6 +1030,7 @@ def clean_markdown_llm(
                 retention * 100,
             )
             cleaned_chunks.append(chunk)
+            prev_tail = chunk.split("\n")[-_OVERLAP_LINES:]
             if report is not None:
                 report.chunks_fell_back += 1
                 report.chunk_details.append({
@@ -919,6 +1043,7 @@ def clean_markdown_llm(
                 })
         else:
             cleaned_chunks.append(cleaned)
+            prev_tail = cleaned.split("\n")[-_OVERLAP_LINES:]
             if report is not None:
                 report.chunk_details.append({
                     "chunk_num": i + 1,
@@ -931,6 +1056,9 @@ def clean_markdown_llm(
 
         if report is not None:
             report.chunk_issues.append(chunk_issues)
+
+        if on_progress is not None:
+            on_progress(i + 1, len(chunks))
 
     return "\n\n".join(cleaned_chunks)
 
@@ -1281,6 +1409,9 @@ def convert_and_clean(
     report: ConversionReport,
     toc_entries: list | None = None,
     total_pages: int = 0,
+    filetype: str = "pdf",
+    ocr_applied: bool = False,
+    on_progress: "Callable[[int, int], None] | None" = None,
 ) -> str:
     """Run the full cleanup pipeline: regex -> LLM -> normalize -> comment artifacts."""
     report.per_stage_words["raw"] = len(md_text.split())
@@ -1292,7 +1423,7 @@ def convert_and_clean(
         logger.warning("Text appears garbled — skipping LLM cleanup")
         return ""
 
-    md_text = clean_markdown_llm(md_text, report=report)
+    md_text = clean_markdown_llm(md_text, report=report, filetype=filetype, ocr_applied=ocr_applied, on_progress=on_progress)
     report.per_stage_words["after_llm"] = len(md_text.split())
 
     md_text = normalize_markdown(md_text, toc_entries=toc_entries)
@@ -1327,7 +1458,8 @@ def convert_html_bytes(html_bytes: bytes) -> str:
 
 
 def convert_file_bytes(
-    file_bytes: bytes, filename: str, filetype: str
+    file_bytes: bytes, filename: str, filetype: str,
+    on_progress: "Callable[[int, int], None] | None" = None,
 ) -> tuple[str, ConversionReport]:
     """Convert in-memory file bytes to a cleaned Markdown string.
 
@@ -1382,6 +1514,8 @@ def convert_file_bytes(
     cleaned = convert_and_clean(
         md_text, report=report, toc_entries=toc_entries,
         total_pages=report.total_pages,
+        filetype=filetype, ocr_applied=report.ocr_needed,
+        on_progress=on_progress,
     )
     logger.info("After cleanup: %d chars, %d words", len(cleaned), len(cleaned.split()))
 

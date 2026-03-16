@@ -76,14 +76,50 @@ def handle_reaction(event, client, logger):
         logger.info("Reaction on message ts=%s but no supported files found", message_ts)
         return
 
+    file_names = [f.get("name", "document") for f, _ in supported]
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=message_ts,
+        text=f"Got it — converting {', '.join(f'`{n}`' for n in file_names)}. This may take a minute.",
+    )
+
     for doc_file, filetype in supported:
         name = doc_file.get("name", "document")
         md_filename = name.rsplit(".", 1)[0] + ".md"
 
+        # Progress callback: post ~33% and ~66% updates to Slack
+        progress_msg_ts = None
+        progress_posted: set = set()
+
+        def on_progress(chunk_num, total_chunks):
+            nonlocal progress_msg_ts
+            if total_chunks < 3:
+                return
+            pct = chunk_num / total_chunks
+            if pct >= 2 / 3:
+                milestone = 66
+            elif pct >= 1 / 3:
+                milestone = 33
+            else:
+                return
+            if milestone in progress_posted:
+                return
+            progress_posted.add(milestone)
+            text = f"Processing `{name}`: ~{milestone}% done ({chunk_num}/{total_chunks} chunks)..."
+            if progress_msg_ts is None:
+                resp = client.chat_postMessage(
+                    channel=channel, thread_ts=message_ts, text=text,
+                )
+                progress_msg_ts = resp["ts"]
+            else:
+                client.chat_update(
+                    channel=channel, ts=progress_msg_ts, text=text,
+                )
+
         try:
             file_bytes = download_file(doc_file["url_private_download"])
             logger.info("Downloaded %s (%s): %d bytes", name, filetype, len(file_bytes))
-            md_text, report = convert_file_bytes(file_bytes, filename=name, filetype=filetype)
+            md_text, report = convert_file_bytes(file_bytes, filename=name, filetype=filetype, on_progress=on_progress)
             logger.info("Converted %s: %d chars of markdown", name, len(md_text))
         except Exception:
             logger.exception("Failed to convert %s", name)
