@@ -430,6 +430,14 @@ class ConversionReport:
                 "below and doing the follow-up fixes in sections, similar to "
                 "how the original conversion chunked things."
             )
+            lines.append(">")
+            lines.append(
+                "> **Targeted fix:** To re-run cleanup on a specific line "
+                "range (e.g., to fix a formatting break at a chunk boundary), "
+                "use: `python convert.py --fix <file.md> --lines <start>-<end>` "
+                "— this re-processes only those lines with surrounding context "
+                "and shows a diff before applying."
+            )
             lines.append("")
             lines.append("```")
             lines.append(
@@ -544,11 +552,13 @@ that repeat at page boundaries) — but keep lines that are meaningful content
 5. Preserve the original structure (headings, lists, paragraphs, tables)
 
 CRITICAL RULES:
-- NEVER delete, summarize, condense, or skip any substantive content
+- NEVER delete, summarize, condense, or skip ANY content — this includes front matter, \
+back matter, license text, boilerplate, and any other text present in the input
 - NEVER merge or combine separate paragraphs or sections
 - Every sentence in the input must appear in the output
 - When in doubt about whether something is an artifact or real content, KEEP IT
-- Your output should be roughly the same length as the input
+- Your output MUST contain every line from the input. Length should be very close to \
+the input — any significant reduction means content was lost
 
 ISSUE REPORTING:
 On the very first line of your response, output a JSON object in this exact format:
@@ -1061,6 +1071,152 @@ def clean_markdown_llm(
             on_progress(i + 1, len(chunks))
 
     return "\n\n".join(cleaned_chunks)
+
+
+# ---------------------------------------------------------------------------
+# Targeted section fix
+# ---------------------------------------------------------------------------
+
+_FIX_SYSTEM_PROMPT = """\
+You are a document cleanup assistant. You are given a specific section of a \
+Markdown file that needs formatting fixes, along with surrounding context \
+(marked as read-only) so you can see the formatting style in use.
+
+Your job:
+1. Match the formatting style of the CONTEXT lines. If the context is verse \
+(one line per verse line with deliberate line breaks), maintain that style. \
+If the context is prose (reflowed paragraphs), maintain that.
+2. Preserve ALL content exactly — do not delete, add, or rephrase anything.
+3. Only fix formatting: line breaks, whitespace, indentation.
+
+Output ONLY the fixed version of the TARGET section. Do NOT include the \
+context lines. Do NOT wrap in code fences."""
+
+_FIX_CONTEXT_LINES = 10
+
+
+def fix_section(
+    file_path: Path, start_line: int, end_line: int, dry_run: bool = False
+) -> bool:
+    """Re-run LLM cleanup on a specific line range of an .md file.
+
+    Shows a diff and asks for confirmation before writing changes.
+    Returns True if changes were applied, False otherwise.
+    """
+    import difflib
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("Error: ANTHROPIC_API_KEY not set")
+        return False
+
+    if not file_path.exists():
+        print(f"Error: file not found: {file_path}")
+        return False
+
+    all_lines = file_path.read_text().splitlines(keepends=True)
+    total_lines = len(all_lines)
+
+    # Validate line range (1-indexed)
+    if start_line < 1 or end_line < start_line or start_line > total_lines:
+        print(f"Error: invalid line range {start_line}-{end_line} (file has {total_lines} lines)")
+        return False
+    end_line = min(end_line, total_lines)
+
+    # Extract context and target (convert to 0-indexed)
+    ctx_before_start = max(0, start_line - 1 - _FIX_CONTEXT_LINES)
+    ctx_after_end = min(total_lines, end_line + _FIX_CONTEXT_LINES)
+
+    before_ctx = "".join(all_lines[ctx_before_start : start_line - 1])
+    target = "".join(all_lines[start_line - 1 : end_line])
+    after_ctx = "".join(all_lines[end_line : ctx_after_end])
+
+    # Build LLM input
+    llm_input_parts = []
+    if before_ctx.strip():
+        llm_input_parts.append(
+            "[CONTEXT BEFORE — read-only, do not include in output]\n"
+            + before_ctx.rstrip("\n") + "\n"
+            + "[END CONTEXT BEFORE]\n"
+        )
+    llm_input_parts.append(
+        "[TARGET SECTION — fix formatting and return only this section]\n"
+        + target.rstrip("\n") + "\n"
+        + "[END TARGET SECTION]\n"
+    )
+    if after_ctx.strip():
+        llm_input_parts.append(
+            "[CONTEXT AFTER — read-only, do not include in output]\n"
+            + after_ctx.rstrip("\n") + "\n"
+            + "[END CONTEXT AFTER]\n"
+        )
+
+    llm_input = "\n".join(llm_input_parts)
+
+    print(f"Fixing lines {start_line}–{end_line} of {file_path.name}")
+    print(f"  Context: {_FIX_CONTEXT_LINES} lines before/after")
+    print(f"  Sending to LLM...")
+
+    client = Anthropic(api_key=api_key)
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=8192,
+            system=_FIX_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": llm_input}],
+            temperature=0,
+        )
+        fixed = response.content[0].text
+    except Exception as exc:
+        print(f"Error: LLM call failed: {exc}")
+        return False
+
+    # Ensure fixed text ends with newline to match file conventions
+    if not fixed.endswith("\n"):
+        fixed += "\n"
+
+    # Show diff
+    original_lines = target.splitlines(keepends=True)
+    fixed_lines = fixed.splitlines(keepends=True)
+
+    diff = list(difflib.unified_diff(
+        original_lines,
+        fixed_lines,
+        fromfile=f"{file_path.name} (original)",
+        tofile=f"{file_path.name} (fixed)",
+        lineterm="",
+    ))
+
+    if not diff:
+        print("  No changes — the LLM returned identical text.")
+        return False
+
+    print()
+    for line in diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            print(f"\033[32m{line}\033[0m", end="")
+        elif line.startswith("-") and not line.startswith("---"):
+            print(f"\033[31m{line}\033[0m", end="")
+        else:
+            print(line, end="")
+        if not line.endswith("\n"):
+            print()
+    print()
+
+    if dry_run:
+        print("  (dry run — no changes written)")
+        return False
+
+    answer = input("Apply this fix? [y/n] ").strip().lower()
+    if answer != "y":
+        print("  Skipped.")
+        return False
+
+    # Splice fixed section back into the file
+    new_lines = all_lines[: start_line - 1] + fixed_lines + all_lines[end_line:]
+    file_path.write_text("".join(new_lines))
+    print(f"  Applied. Updated {file_path.name}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1846,7 +2002,20 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     parser = argparse.ArgumentParser(description="Batch-convert documents to Markdown")
+    parser.add_argument("--fix", metavar="FILE", help="Fix a specific line range in an .md file")
+    parser.add_argument("--lines", metavar="START-END", help="Line range for --fix (e.g., 5920-5960)")
+    parser.add_argument("--dry-run", action="store_true", help="Show diff without applying changes (use with --fix)")
     parser.add_argument("input", nargs="?", default="input", help="Input folder (default: input/)")
     parser.add_argument("output", nargs="?", default="output", help="Output folder (default: output/)")
     args = parser.parse_args()
-    convert_docs(Path(args.input), Path(args.output))
+
+    if args.fix:
+        if not args.lines:
+            parser.error("--fix requires --lines START-END (e.g., --lines 5920-5960)")
+        match = re.match(r"^(\d+)-(\d+)$", args.lines)
+        if not match:
+            parser.error(f"Invalid line range: {args.lines} (expected START-END, e.g., 5920-5960)")
+        start, end = int(match.group(1)), int(match.group(2))
+        fix_section(Path(args.fix), start, end, dry_run=args.dry_run)
+    else:
+        convert_docs(Path(args.input), Path(args.output))
